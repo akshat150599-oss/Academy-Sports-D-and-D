@@ -212,9 +212,17 @@ def _to_num(val):
     if val is None:
         return None
     try:
-        if isinstance(val, str) and val.strip() == "":
-            return None
-        num = float(val)
+        if isinstance(val, str):
+            s = val.strip()
+            if s == "":
+                return None
+            # strip currency symbols, codes, commas, spaces -> keep digits, dot, minus
+            s = re.sub(r"[^0-9.\-]", "", s)
+            if s in ("", "-", ".", "-.", "--"):
+                return None
+            num = float(s)
+        else:
+            num = float(val)
         if np.isnan(num):
             return None
         return num
@@ -289,14 +297,16 @@ def _to_profile(rec, is_estimate=False, label=None):
 def build_contract_candidates(contracts_list):
     """
     Build a scored list of contract candidates.
-    Each candidate carries its identifiers and a specificity score.
+    Each candidate carries its identifiers (normalized) and a specificity score.
+    The carrier identifier is normalized so it can match either a shipment SCAC
+    or a shipment carrier NAME (contracts often key on the carrier name).
     """
     candidates = []
     for rec in contracts_list or []:
-        carrier = _clean_text(rec.get("carrierScac")).upper()
-        ffw = _clean_text(rec.get("ffwScac")).upper()
-        pol = _clean_text(rec.get("pol")).upper()
-        pod = _clean_text(rec.get("pod")).upper()
+        carrier = _norm_key(rec.get("carrierScac"))
+        ffw = _norm_key(rec.get("ffwScac"))
+        pol = _norm_key(rec.get("pol"))
+        pod = _norm_key(rec.get("pod"))
         specificity = sum(1 for x in [carrier, ffw, pol, pod] if x)
         candidates.append({
             "carrier": carrier, "ffw": ffw, "pol": pol, "pod": pod,
@@ -308,25 +318,28 @@ def build_contract_candidates(contracts_list):
     return candidates
 
 
-def match_contract(candidates, ship_carrier, ship_ffw, ship_pol, ship_pod):
+def match_contract(candidates, ship_carrier_scac, ship_carrier_name, ship_ffw, ship_pol, ship_pod):
     """
     Return (profile, matched_party_type) for the most specific matching contract row,
     or (None, "Missing") if nothing matches.
+
+    Carrier matching is name-OR-SCAC: a contract carrier identifier matches if it
+    equals the shipment's SCAC or its carrier name (both normalized).
     """
-    sc = _clean_text(ship_carrier).upper()
-    sf = _clean_text(ship_ffw).upper()
-    sp = _clean_text(ship_pol).upper()
-    sd = _clean_text(ship_pod).upper()
+    carrier_norms = {n for n in (_norm_key(ship_carrier_scac), _norm_key(ship_carrier_name)) if n}
+    ffw_norm = _norm_key(ship_ffw)
+    pol_norm = _norm_key(ship_pol)
+    pod_norm = _norm_key(ship_pod)
 
     for cand in candidates:
         # Every identifier the row specifies must match the shipment (blank = wildcard).
-        if cand["carrier"] and cand["carrier"] != sc:
+        if cand["carrier"] and cand["carrier"] not in carrier_norms:
             continue
-        if cand["ffw"] and cand["ffw"] != sf:
+        if cand["ffw"] and cand["ffw"] != ffw_norm:
             continue
-        if cand["pol"] and cand["pol"] != sp:
+        if cand["pol"] and cand["pol"] != pol_norm:
             continue
-        if cand["pod"] and cand["pod"] != sd:
+        if cand["pod"] and cand["pod"] != pod_norm:
             continue
 
         if cand["carrier"]:
@@ -334,7 +347,7 @@ def match_contract(candidates, ship_carrier, ship_ffw, ship_pol, ship_pod):
         elif cand["ffw"]:
             party = "FFW"
         else:
-            party = "Carrier" if sc else ("FFW" if sf else "Global")
+            party = "Carrier" if carrier_norms else ("FFW" if ffw_norm else "Global")
         return cand["profile"], party
 
     return None, "Missing"
@@ -483,6 +496,7 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
 
     for _, row in df.iterrows():
         carrier_scac = _clean_text(row.get("CARRIER_SCAC", ""))
+        carrier_name = _clean_text(row.get("CARRIER_NAME", ""))
         ffw_scac = _clean_text(row.get("FFW_SCAC", ""))
         pol_locode = _clean_text(row.get("POL_LOCODE", ""))
         pod_locode = _clean_text(row.get("POD_LOCODE", ""))
@@ -491,7 +505,7 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
             profile = estimate_profile
             party_type = "Estimate"
         else:
-            profile, party_type = match_contract(candidates, carrier_scac, ffw_scac, pol_locode, pod_locode)
+            profile, party_type = match_contract(candidates, carrier_scac, carrier_name, ffw_scac, pol_locode, pod_locode)
 
         cgi, cll = row["CGI"], row["CLL"]
         cdd, cgo, cer = row["CDD"], row["CGO"], row["CER"]
