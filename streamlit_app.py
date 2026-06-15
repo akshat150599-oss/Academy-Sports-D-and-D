@@ -112,30 +112,100 @@ st.markdown(
 # -----------------------------------------------------------------------------
 # FLEXIBLE CONTRACT CSV PARSER (single flat rates)
 # -----------------------------------------------------------------------------
-# Canonical field -> list of accepted header spellings (matched case/punctuation-insensitive)
-COLUMN_ALIASES = {
-    "carrierScac": ["carrierscac", "carrier", "scac", "carriercode", "carriersymbol"],
-    "ffwScac": ["ffwscac", "ffw", "forwarder", "forwarderscac", "freightforwarder",
-                "freightforwarderscac", "freightforwardercode"],
-    "pol": ["portofloadinglocode", "pol", "pollocode", "portofloading", "loadport"],
-    "pod": ["portofdischargelocode", "pod", "podlocode", "portofdischarge", "dischargeport",
-            "terminalidentifier", "terminal"],
-    "demRate": ["demurragerate", "demrate", "demurragedailyrate", "demurrage",
-                "demurrageratusdperday", "demurrageusdperday", "demurrageperday",
-                "demurrageratusd", "demurrageamount"],
-    "demFree": ["demurragefreedays", "freedemurragedays", "demfreedays", "demurragefree",
-                "freedemurrage"],
-    "detRate": ["detentionrate", "detrate", "detentiondailyrate", "detention",
-                "detentionusdperday", "detentionperday", "detentionamount"],
-    "detFree": ["detentionfreedays", "freedetentiondays", "detfreedays", "detentionfree",
-                "freedetention"],
-    "combinedFree": ["combinedfreedays", "combinedfree", "freedayscombined"],
-    "currency": ["currency", "curr", "ccy"],
-}
-
-
 def _norm_key(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower()) if text is not None else ""
+
+
+def _fmt_money(decimals=2):
+    """Return a null-safe currency formatter for Styler.format (never raises on None/NaN)."""
+    def inner(v):
+        try:
+            if v is None:
+                return "—"
+            if isinstance(v, float) and np.isnan(v):
+                return "—"
+            return f"${float(v):,.{decimals}f}"
+        except (TypeError, ValueError):
+            return "—"
+    return inner
+
+
+def _fmt_days(decimals=1):
+    """Return a null-safe day formatter for Styler.format."""
+    def inner(v):
+        try:
+            if v is None:
+                return "—"
+            if isinstance(v, float) and np.isnan(v):
+                return "—"
+            return f"{float(v):,.{decimals}f}"
+        except (TypeError, ValueError):
+            return "—"
+    return inner
+
+
+def _resolve_contract_columns(columns):
+    """
+    Heuristically map raw contract headers to canonical fields by KEYWORD, not exact name.
+
+    This is forgiving of real-world header variations such as:
+      "Demurrage", "Demurrage Rate", "Demurrage Rate (USD/Day)", "Daily Demurrage Charge",
+      "Demurrage Per Diem", "Free Demurrage Days", "Detention Free Time", "Combined Free Days",
+      "Carrier SCAC", "SCAC", "Freight Forwarder", "POL", "Port of Discharge", "Terminal", ...
+
+    First column that fits each canonical field wins.
+    """
+    resolved = {}
+
+    def take(key, col):
+        if key not in resolved:
+            resolved[key] = col
+
+    for col in columns:
+        n = _norm_key(col)
+        if not n:
+            continue
+
+        # tolerate common misspellings of demurrage
+        has_dem = any(t in n for t in ["demurrage", "demurage", "demmurage", "demmurrage", "demurr"])
+        has_det = "detention" in n
+        # short-token fallback only when unambiguous
+        if not has_dem and not has_det:
+            if re.search(r"(^|[^a-z])dem", n) and "det" not in n:
+                has_dem = True
+            elif re.search(r"(^|[^a-z])det", n) and "dem" not in n:
+                has_det = True
+
+        is_free = "free" in n
+        is_combined = "combined" in n
+        is_ffw = ("ffw" in n) or ("forward" in n)
+        is_carrier = ("carrier" in n) or (n == "scac") or (n.endswith("scac") and not is_ffw)
+        is_pol = ("portofloading" in n) or ("loadport" in n) or ("loadingport" in n) or n in ("pol", "pollocode", "loadlocode")
+        is_pod = ("portofdischarge" in n) or ("dischargeport" in n) or ("terminal" in n) or n in ("pod", "podlocode", "dischargelocode")
+        is_currency = n in ("currency", "curr", "ccy")
+
+        if is_combined and is_free:
+            take("combinedFree", col); continue
+        if has_dem and is_free:
+            take("demFree", col); continue
+        if has_det and is_free:
+            take("detFree", col); continue
+        if has_dem:
+            take("demRate", col); continue
+        if has_det:
+            take("detRate", col); continue
+        if is_currency:
+            take("currency", col); continue
+        if is_ffw:
+            take("ffwScac", col); continue
+        if is_carrier:
+            take("carrierScac", col); continue
+        if is_pol:
+            take("pol", col); continue
+        if is_pod:
+            take("pod", col); continue
+
+    return resolved
 
 
 def _to_num(val):
@@ -174,14 +244,8 @@ def parse_contracts_csv(contract_file):
     """
     cdf = pd.read_csv(contract_file)
 
-    # Map each actual column to a canonical field name.
-    resolved = {}
-    for actual_col in cdf.columns:
-        norm = _norm_key(actual_col)
-        for canonical, spellings in COLUMN_ALIASES.items():
-            if norm in spellings and canonical not in resolved:
-                resolved[canonical] = actual_col
-                break
+    # Map each actual column to a canonical field name by keyword.
+    resolved = _resolve_contract_columns(cdf.columns)
 
     records = []
     for _, raw in cdf.iterrows():
@@ -319,7 +383,53 @@ def _shipment_match_identity(row):
     return "", "Missing"
 
 
+def _resolve_shipment_columns(df):
+    """
+    Rename shipment columns to canonical names using case/punctuation-insensitive
+    matching plus a few common aliases. Only fills a canonical name if it isn't
+    already present, so exact matches are left untouched.
+    """
+    canonical_aliases = {
+        "SHIPMENT_ID": ["shipmentid", "shipment", "shipmentnumber", "shipmentno", "loadid"],
+        "CONTAINER_NUMBER": ["containernumber", "container", "containerno", "containerid", "equipmentid"],
+        "CARRIER_SCAC": ["carrierscac", "carriercode", "scac", "carrier"],
+        "CARRIER_NAME": ["carriername", "carrier"],
+        "FFW_SCAC": ["ffwscac", "ffw", "forwarderscac", "freightforwarderscac", "forwarder", "freightforwarder"],
+        "POL_LOCODE": ["pollocode", "pol", "portofloadinglocode", "portofloading", "loadlocode"],
+        "POL": ["polname", "portofloadingname"],
+        "POD_LOCODE": ["podlocode", "pod", "portofdischargelocode", "portofdischarge", "dischargelocode"],
+        "POD": ["podname", "portofdischargename"],
+        "SUBSCRIPTION_STATUS": ["subscriptionstatus", "substatus", "status"],
+        "LIFECYCLE_STATUS": ["lifecyclestatus", "lifecycle"],
+        "SHIPMENT_MODIFIED_DATE": ["shipmentmodifieddate", "modifieddate", "lastmodified", "lastmodifieddate", "updateddate"],
+        "CGI": ["cgi", "gateinatpol", "containergatein", "gatein", "gateinpol"],
+        "CLL": ["cll", "loadedonvessel", "containerloaded", "loadedonboard", "containerloadedonvessel"],
+        "CDD": ["cdd", "dischargeatpod", "discharge", "containerdischarge", "discharged"],
+        "CGO": ["cgo", "gateoutfull", "gateoutatpod", "gateoutfullatpod", "gateout"],
+        "CER": ["cer", "emptyreturn", "containeremptyreturn", "emptycontainerreturn"],
+        "CEP": ["cep"],
+        "VAD": ["vad", "vesselarrival", "vesselarrivaldischarge"],
+        "VDL": ["vdl", "vesseldeparture", "vesseldepartureload"],
+    }
+    norm_to_actual = {}
+    for actual in df.columns:
+        norm_to_actual.setdefault(_norm_key(actual), actual)
+
+    for canonical, aliases in canonical_aliases.items():
+        if canonical in df.columns:
+            continue
+        for alias in aliases:
+            if alias in norm_to_actual:
+                src = norm_to_actual[alias]
+                if src not in canonical_aliases:  # don't overwrite a column that is itself canonical
+                    df[canonical] = df[src]
+                    break
+    return df
+
+
 def normalize_required_columns(df):
+    df = _resolve_shipment_columns(df)
+
     ffw_aliases = [
         "FFW_SCAC", "FFW", "FFW_SCAC_CODE", "FREIGHT_FORWARDER_SCAC",
         "FREIGHT_FORWARDER", "FORWARDER_SCAC", "FORWARDER", "FREIGHT_FORWARDER_CODE",
@@ -730,6 +840,20 @@ if rate_source == "Upload Contract CSV" and uploaded_contract_file is not None:
             st.markdown(f"**Rows with demurrage rate:** {dem_set} | **with detention rate:** {det_set}")
             if globals_rows:
                 st.markdown(f"**Global default rows (no identifiers):** {globals_rows}")
+            # Loud warning if the rate columns were not found -> this is the usual cause of $0.
+            if "demRate" not in contract_resolved and "detRate" not in contract_resolved:
+                st.error(
+                    "⚠️ No demurrage or detention **rate** column was recognized — every cost will be $0.\n\n"
+                    "Your contract columns are: " + ", ".join(str(c) for c in contracts_df.columns) +
+                    "\n\nRename a rate column to include the word 'demurrage' / 'detention' (e.g. "
+                    "`Demurrage Rate`, `Detention Rate`), or send me the header row and I'll map it."
+                )
+            elif "demRate" not in contract_resolved:
+                st.warning("⚠️ No **demurrage** rate column recognized — POL & POD demurrage will be $0. "
+                           "Columns seen: " + ", ".join(str(c) for c in contracts_df.columns))
+            elif "detRate" not in contract_resolved:
+                st.warning("⚠️ No **detention** rate column recognized — POD detention will be $0. "
+                           "Columns seen: " + ", ".join(str(c) for c in contracts_df.columns))
     except Exception as e:
         st.sidebar.error(f"❌ Error parsing contract CSV: {e}")
         contracts_list = None
@@ -878,6 +1002,53 @@ tab_overview, tab_trends, tab_carrier, tab_port, tab_ships, tab_gaps, tab_downlo
 # -----------------------------------------------------------------------------
 with tab_overview:
     st.markdown("### Executive Summary")
+
+    # --- Self-diagnostics: explain a $0 / empty result without needing the logs ---
+    with st.expander("🔧 Data diagnostics — open this if costs look like $0"):
+        diag_total = rdf["TOTAL_DD_COST"].sum() if not rdf.empty else 0
+        # Contract rate coverage
+        if rate_source == "Upload Contract CSV" and contracts_list is not None:
+            st.markdown("**Contract**")
+            st.write({
+                "recognized_columns": contract_resolved,
+                "raw_columns": list(contracts_df.columns) if contracts_df is not None else [],
+                "demurrage_rates_found": sorted({c.get("demRate") for c in contracts_list if c.get("demRate") is not None}),
+                "detention_rates_found": sorted({c.get("detRate") for c in contracts_list if c.get("detRate") is not None}),
+            })
+            if "demRate" not in contract_resolved and "detRate" not in contract_resolved:
+                st.error("No rate column recognized → all costs are $0. Rename a column to contain "
+                         "'demurrage'/'detention', or send the header row.")
+        elif rate_source == "Estimate Rates" and estimate_profile is not None:
+            st.markdown("**Estimate rates**")
+            st.write({"demurrage_rate": estimate_profile.get("dem_rate"),
+                      "detention_rate": estimate_profile.get("det_rate"),
+                      "dem_free": estimate_profile.get("dem_free"),
+                      "det_free": estimate_profile.get("det_free")})
+            if not estimate_profile.get("dem_rate") and not estimate_profile.get("det_rate"):
+                st.error("Both estimate rates are 0 → all costs are $0. Enter a demurrage and/or detention rate in the sidebar.")
+
+        # Matched shipments: rate + dwell-day coverage
+        if not rdf.empty:
+            n = len(rdf)
+            with_rate = int(rdf["DEM_RATE"].notna().sum()) if "DEM_RATE" in rdf.columns else 0
+            pol_ok = int(pd.to_numeric(rdf.get("POL_DEM_TOTAL_DAYS"), errors="coerce").notna().sum())
+            pod_ok = int(pd.to_numeric(rdf.get("POD_DEM_TOTAL_DAYS"), errors="coerce").notna().sum())
+            det_ok = int(pd.to_numeric(rdf.get("POD_DET_TOTAL_DAYS"), errors="coerce").notna().sum())
+            st.markdown("**Matched shipments**")
+            st.write({
+                "matched_shipments": n,
+                "with_a_demurrage_rate": f"{with_rate}/{n}",
+                "with_POL_demurrage_days (CGI→CLL)": f"{pol_ok}/{n}",
+                "with_POD_demurrage_days (CDD→CGO)": f"{pod_ok}/{n}",
+                "with_POD_detention_days (CGO→…)": f"{det_ok}/{n}",
+                "total_DD_cost": f"${diag_total:,.2f}",
+            })
+            if with_rate == 0:
+                st.error("Matched shipments carry NO rate → the contract rate column wasn't read. See the Contract section above.")
+            elif pol_ok == 0 and pod_ok == 0 and det_ok == 0:
+                st.error("No dwell days computed → milestone columns (CGI/CLL/CDD/CGO/CER) weren't found or are empty. "
+                         "Check the shipment file's milestone column names.")
+
     if fdf.empty:
         st.warning("No matched shipments available for the selected filters.")
     else:
@@ -1229,8 +1400,9 @@ with tab_ships:
         show_df = show_df.drop(columns=["DET_ACCUMULATING", "DET_END_SOURCE"], errors="ignore")
         st.dataframe(
             show_df.style.format({
-                "DEM_RATE": "${:,.0f}", "DET_RATE": "${:,.0f}",
-                "POL_DEM_COST": "${:,.2f}", "POD_DEM_COST": "${:,.2f}", "POD_DET_COST": "${:,.2f}", "TOTAL_DD_COST": "${:,.2f}"}),
+                "DEM_RATE": _fmt_money(0), "DET_RATE": _fmt_money(0),
+                "POL_DEM_COST": _fmt_money(2), "POD_DEM_COST": _fmt_money(2),
+                "POD_DET_COST": _fmt_money(2), "TOTAL_DD_COST": _fmt_money(2)}),
             use_container_width=True, hide_index=True, height=600,
         )
 
