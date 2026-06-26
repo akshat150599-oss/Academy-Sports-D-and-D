@@ -5,22 +5,24 @@ Standalone Streamlit app for ocean shipment demurrage and detention cost analysi
 simplified for a flat single-rate contract.
 
 Contract model (Academy Sports):
-  - ONE demurrage rate (USD/day). Used for BOTH POL demurrage and POD demurrage.
+  - ONE demurrage rate (USD/day). Used for POD demurrage.
   - ONE detention rate (USD/day). Used for POD detention.
   - Optional demurrage free days and detention free days.
   - Optional combined free days for POD demurrage + POD detention.
-  - No tiers. No POL/POD split inside the contract — the single demurrage rate covers both legs.
+  - No tiers.
+  - NOTE: The customer is NOT charged demurrage at the port of loading (POL),
+    so POL demurrage is not calculated or reported. POL is still tracked as a
+    location for contract matching, lane analysis, and filtering.
 
 Calculation Logic:
-  POL Demurrage = Container Loaded on Vessel - Container Gate In at POL  (CLL - CGI)  -> demurrage rate
-  POD Demurrage = Gate Out Full from POD     - Discharge at POD          (CGO - CDD)  -> demurrage rate
-  POD Detention = Container Empty Return     - Gate Out Full from POD    (CER - CGO)  -> detention rate
+  POD Demurrage = Gate Out Full from POD - Discharge at POD          (CGO - CDD)  -> demurrage rate
+  POD Detention = Container Empty Return - Gate Out Full from POD    (CER - CGO)  -> detention rate
 
 Free days:
-  - POL demurrage and POD demurrage each deduct the demurrage free days.
+  - POD demurrage deducts the demurrage free days.
   - POD detention deducts the detention free days.
   - If combined free days is set: POD demurrage consumes the pool first, POD detention
-    receives the remainder. POL demurrage is never part of the combined pool.
+    receives the remainder.
 
 Exclusion rule:
   CANCELLED -> shipment excluded from D&D entirely.
@@ -59,7 +61,6 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # COLORS
 # -----------------------------------------------------------------------------
-POL_DEM_COLOR = "#00a6ff"
 DEM_COLOR = "#f5a623"
 DET_COLOR = "#7b61ff"
 TOTAL_COLOR = "#00d4aa"
@@ -467,7 +468,7 @@ def normalize_required_columns(df):
 
 
 # -----------------------------------------------------------------------------
-# D&D CALCULATION ENGINE (flat single rates)
+# D&D CALCULATION ENGINE (flat single rates) — POD demurrage + POD detention only
 # -----------------------------------------------------------------------------
 def process_shipments(df, contracts_list=None, estimate_profile=None, use_estimate=False):
     df = normalize_required_columns(df.copy())
@@ -511,7 +512,6 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
         cdd, cgo, cer = row["CDD"], row["CGO"], row["CER"]
         sub_status = row.get("SUBSCRIPTION_STATUS", "")
 
-        pol_dem_total = _days_between(cll, cgi)
         pod_dem_total = _days_between(cgo, cdd)
 
         pod_det_total = None
@@ -547,8 +547,6 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
             "POD": row.get("POD", ""),
             "SUBSCRIPTION_STATUS": sub_status,
             "LIFECYCLE_STATUS": row.get("LIFECYCLE_STATUS", ""),
-            "CGI": cgi if not pd.isna(cgi) else pd.NaT,
-            "CLL": cll if not pd.isna(cll) else pd.NaT,
             "CDD": cdd if not pd.isna(cdd) else pd.NaT,
             "CGO": cgo if not pd.isna(cgo) else pd.NaT,
             "CER": cer if not pd.isna(cer) else pd.NaT,
@@ -556,7 +554,6 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
             "DD_ANCHOR_DATE": cdd if not pd.isna(cdd) else (
                 cgo if not pd.isna(cgo) else (
                     cer if not pd.isna(cer) else (cll if not pd.isna(cll) else cgi))),
-            "POL_DEM_TOTAL_DAYS": round(pol_dem_total, 2) if pol_dem_total is not None else None,
             "POD_DEM_TOTAL_DAYS": round(pod_dem_total, 2) if pod_dem_total is not None else None,
             "POD_DET_TOTAL_DAYS": round(pod_det_total, 2) if pod_det_total is not None else None,
             "DET_ACCUMULATING": det_accumulating,
@@ -567,8 +564,6 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
 
         if profile is None:
             reason_parts = []
-            if pd.isna(cgi) or pd.isna(cll):
-                reason_parts.append("Cannot evaluate POL demurrage; missing CGI or CLL")
             if pd.isna(cdd) or pd.isna(cgo):
                 reason_parts.append("Cannot evaluate POD demurrage; missing CDD or CGO")
             if pd.isna(cgo):
@@ -593,12 +588,6 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
         combined_free = profile.get("combined_free")
         has_combined = combined_free is not None
 
-        # POL demurrage (always separate; uses the single demurrage rate)
-        pol_dem_chargeable = 0.0
-        if pol_dem_total is not None:
-            pol_dem_chargeable = max(0.0, pol_dem_total - dem_free)
-        pol_dem_cost = _flat_cost(pol_dem_chargeable, dem_rate)
-
         # POD demurrage + POD detention (combined pool optional)
         pod_dem_chargeable = 0.0
         pod_det_chargeable = 0.0
@@ -619,7 +608,7 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
 
         pod_dem_cost = _flat_cost(pod_dem_chargeable, dem_rate)
         pod_det_cost = _flat_cost(pod_det_chargeable, det_rate)
-        total_cost = round(pol_dem_cost + pod_dem_cost + pod_det_cost, 2)
+        total_cost = round(pod_dem_cost + pod_det_cost, 2)
 
         mrec = base.copy()
         mrec.update({
@@ -631,13 +620,11 @@ def process_shipments(df, contracts_list=None, estimate_profile=None, use_estima
             "DET_FREE_DAYS": det_free,
             "COMBINED_FREE_DAYS": combined_free,
             "CONTRACT_TYPE": "Estimate" if use_estimate else ("Combined" if has_combined else "Separate"),
-            "POL_DEM_CHARGEABLE_DAYS": round(pol_dem_chargeable, 2),
-            "POL_DEM_COST": pol_dem_cost,
             "POD_DEM_CHARGEABLE_DAYS": round(pod_dem_chargeable, 2),
             "POD_DEM_COST": pod_dem_cost,
             "POD_DET_CHARGEABLE_DAYS": round(pod_det_chargeable, 2),
             "POD_DET_COST": pod_det_cost,
-            "DEM_COST": round(pol_dem_cost + pod_dem_cost, 2),
+            "DEM_COST": pod_dem_cost,
             "DET_COST": pod_det_cost,
             "TOTAL_DD_COST": total_cost,
         })
@@ -660,26 +647,20 @@ def enrich_unmatched_risk(unmatched_df, matched_df):
         s = s[s > 0]
         return s.mean() if len(s) else np.nan
 
-    avg_pol = positive_mean(matched_df, "POL_DEM_TOTAL_DAYS")
     avg_pod = positive_mean(matched_df, "POD_DEM_TOTAL_DAYS")
     avg_det = positive_mean(matched_df, "POD_DET_TOTAL_DAYS")
-    if np.isnan(avg_pol):
-        avg_pol = 3.0
     if np.isnan(avg_pod):
         avg_pod = 3.0
     if np.isnan(avg_det):
         avg_det = 5.0
 
-    unmatched_df["AVG_POL_DEM_BENCHMARK"] = round(avg_pol, 2)
     unmatched_df["AVG_POD_DEM_BENCHMARK"] = round(avg_pod, 2)
     unmatched_df["AVG_POD_DET_BENCHMARK"] = round(avg_det, 2)
 
     flags, reasons, scores = [], [], []
     for _, row in unmatched_df.iterrows():
         rs, score = [], 0
-        pol_d, pod_d, det_d = row.get("POL_DEM_TOTAL_DAYS"), row.get("POD_DEM_TOTAL_DAYS"), row.get("POD_DET_TOTAL_DAYS")
-        if pd.notna(pol_d) and pol_d > avg_pol:
-            rs.append(f"POL demurrage {pol_d:.1f}d vs avg {avg_pol:.1f}d"); score += 1
+        pod_d, det_d = row.get("POD_DEM_TOTAL_DAYS"), row.get("POD_DET_TOTAL_DAYS")
         if pd.notna(pod_d) and pod_d > avg_pod:
             rs.append(f"POD demurrage {pod_d:.1f}d vs avg {avg_pod:.1f}d"); score += 1
         if pd.notna(det_d) and det_d > avg_det:
@@ -708,21 +689,18 @@ def format_datetime_cols(dl, cols):
 
 def build_download_df(data):
     dl = data.copy()
-    dl = format_datetime_cols(dl, ["CGI", "CLL", "CDD", "CGO", "CER", "DET_END_TS"])
+    dl = format_datetime_cols(dl, ["CDD", "CGO", "CER", "DET_END_TS"])
     rename_map = {
         "SHIPMENT_ID": "Shipment ID", "CONTAINER_NUMBER": "Container",
         "CARRIER_SCAC": "Carrier SCAC", "CARRIER_NAME": "Carrier Name",
         "FFW_SCAC": "Freight Forwarder SCAC", "CARRIER_FFW_SCAC": "Carrier / FFW SCAC",
         "MATCHED_PARTY_TYPE": "Matched Party Type", "POL_LOCODE": "Port of Loading",
         "POD_LOCODE": "Port of Discharge", "LANE": "Lane", "SUBSCRIPTION_STATUS": "Subscription Status",
-        "CGI": "Gate In at POL (CGI)", "CLL": "Loaded on Vessel (CLL)",
         "CDD": "Discharge at POD (CDD)", "CGO": "Gate Out Full at POD (CGO)", "CER": "Empty Return (CER)",
         "DEM_RATE": "Demurrage Rate (USD/day)", "DET_RATE": "Detention Rate (USD/day)",
         "DEM_FREE_DAYS": "Free Demurrage Days", "DET_FREE_DAYS": "Free Detention Days",
         "COMBINED_FREE_DAYS": "Combined Free Days", "CONTRACT_TYPE": "Free Days Type",
         "CONTRACT_IDENTIFIER": "Matched Contract",
-        "POL_DEM_TOTAL_DAYS": "POL Demurrage Total Days", "POL_DEM_CHARGEABLE_DAYS": "POL Demurrage Chargeable Days",
-        "POL_DEM_COST": "POL Demurrage Cost (USD)",
         "POD_DEM_TOTAL_DAYS": "POD Demurrage Total Days", "POD_DEM_CHARGEABLE_DAYS": "POD Demurrage Chargeable Days",
         "POD_DEM_COST": "POD Demurrage Cost (USD)",
         "POD_DET_TOTAL_DAYS": "POD Detention Total Days", "POD_DET_CHARGEABLE_DAYS": "POD Detention Chargeable Days",
@@ -738,11 +716,10 @@ def build_download_df(data):
     desired_order = [
         "Shipment ID", "Container", "Carrier SCAC", "Carrier Name", "Freight Forwarder SCAC",
         "Carrier / FFW SCAC", "Matched Party Type", "Matched Contract", "Lane", "Port of Loading",
-        "Port of Discharge", "Subscription Status", "Gate In at POL (CGI)", "Loaded on Vessel (CLL)",
+        "Port of Discharge", "Subscription Status",
         "Discharge at POD (CDD)", "Gate Out Full at POD (CGO)", "Empty Return (CER)",
         "Demurrage Rate (USD/day)", "Detention Rate (USD/day)", "Free Days Type",
         "Free Demurrage Days", "Free Detention Days", "Combined Free Days",
-        "POL Demurrage Total Days", "POL Demurrage Chargeable Days", "POL Demurrage Cost (USD)",
         "POD Demurrage Total Days", "POD Demurrage Chargeable Days", "POD Demurrage Cost (USD)",
         "POD Detention Total Days", "POD Detention Chargeable Days", "POD Detention Cost (USD)",
         "Total Demurrage Cost (USD)", "Total Detention Cost (USD)", "Total D&D Cost (USD)",
@@ -757,15 +734,15 @@ def build_unmatched_download_df(data):
     if data.empty:
         return data.copy()
     dl = data.copy()
-    dl = format_datetime_cols(dl, ["CGI", "CLL", "CDD", "CGO", "CER", "DET_END_TS"])
+    dl = format_datetime_cols(dl, ["CDD", "CGO", "CER", "DET_END_TS"])
     rename_map = {
         "SHIPMENT_ID": "Shipment ID", "CONTAINER_NUMBER": "Container",
         "CARRIER_SCAC": "Carrier SCAC", "CARRIER_NAME": "Carrier Name",
         "POL_LOCODE": "Port of Loading", "POD_LOCODE": "Port of Discharge", "LANE": "Lane",
-        "SUBSCRIPTION_STATUS": "Subscription Status", "CGI": "Gate In at POL (CGI)",
-        "CLL": "Loaded on Vessel (CLL)", "CDD": "Discharge at POD (CDD)",
+        "SUBSCRIPTION_STATUS": "Subscription Status",
+        "CDD": "Discharge at POD (CDD)",
         "CGO": "Gate Out Full at POD (CGO)", "CER": "Empty Return (CER)",
-        "POL_DEM_TOTAL_DAYS": "POL Demurrage Days", "POD_DEM_TOTAL_DAYS": "POD Demurrage Days",
+        "POD_DEM_TOTAL_DAYS": "POD Demurrage Days",
         "POD_DET_TOTAL_DAYS": "POD Detention Days", "MATCH_KEY": "Match Key",
         "RISK_FLAG": "Risk Flag", "RISK_SCORE": "Risk Score", "RISK_REASONS": "Risk Reasons",
         "DATA_LIMITATION": "Data Limitation",
@@ -780,7 +757,7 @@ def build_unmatched_download_df(data):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 🚢 D&D Analyzer — Academy Sports")
-    st.caption("Single flat demurrage rate (POL + POD) · single flat detention rate")
+    st.caption("Single flat demurrage rate (POD) · single flat detention rate · POL not charged")
     st.markdown("---")
 
     rate_source = st.radio(
@@ -803,25 +780,23 @@ with st.sidebar:
         )
     else:
         st.markdown("#### Estimate Rates")
-        st.caption("Flat USD/day rates. The demurrage rate applies to both POL and POD demurrage.")
-        est_dem_rate = st.number_input("Demurrage rate (USD/day) — POL & POD", min_value=0.0, value=0.0, step=25.0)
+        st.caption("Flat USD/day rates. The demurrage rate applies to POD demurrage.")
+        est_dem_rate = st.number_input("Demurrage rate (USD/day) — POD", min_value=0.0, value=0.0, step=25.0)
         est_det_rate = st.number_input("Detention rate (USD/day) — POD", min_value=0.0, value=0.0, step=25.0)
         use_combined = st.checkbox(
             "Use combined free days for POD demurrage + POD detention",
             value=False,
-            help="POD demurrage consumes the pool first; POD detention gets the remainder. POL demurrage is separate.",
+            help="POD demurrage consumes the pool first; POD detention gets the remainder.",
         )
         if use_combined:
             est_combined_free = st.number_input("Combined POD free days", min_value=0.0, value=0.0, step=1.0)
-            est_dem_free = st.number_input("POL free demurrage days", min_value=0.0, value=0.0, step=1.0)
-            est_det_free = 0.0
             estimate_profile = _to_profile({
                 "demRate": est_dem_rate, "detRate": est_det_rate,
-                "demFree": est_dem_free, "detFree": est_det_free,
+                "demFree": 0.0, "detFree": 0.0,
                 "combinedFree": est_combined_free,
             }, is_estimate=True, label="Estimate")
         else:
-            est_dem_free = st.number_input("Free demurrage days (each leg)", min_value=0.0, value=0.0, step=1.0)
+            est_dem_free = st.number_input("Free demurrage days (POD)", min_value=0.0, value=0.0, step=1.0)
             est_det_free = st.number_input("Free detention days", min_value=0.0, value=0.0, step=1.0)
             estimate_profile = _to_profile({
                 "demRate": est_dem_rate, "detRate": est_det_rate,
@@ -863,7 +838,7 @@ if rate_source == "Upload Contract CSV" and uploaded_contract_file is not None:
                     "`Demurrage Rate`, `Detention Rate`), or send me the header row and I'll map it."
                 )
             elif "demRate" not in contract_resolved:
-                st.warning("⚠️ No **demurrage** rate column recognized — POL & POD demurrage will be $0. "
+                st.warning("⚠️ No **demurrage** rate column recognized — POD demurrage will be $0. "
                            "Columns seen: " + ", ".join(str(c) for c in contracts_df.columns))
             elif "detRate" not in contract_resolved:
                 st.warning("⚠️ No **detention** rate column recognized — POD detention will be $0. "
@@ -898,10 +873,9 @@ if missing_contract or missing_shipments:
         "# Column spelling is flexible (case / underscores / spaces ignored).",
         language=None,
     )
-    st.markdown("**Pricing logic:**")
+    st.markdown("**Pricing logic** (POL is not charged):")
     st.code(
-        "POL Demurrage = CGI → CLL   priced at the demurrage rate\n"
-        "POD Demurrage = CDD → CGO   priced at the demurrage rate (same rate)\n"
+        "POD Demurrage = CDD → CGO   priced at the demurrage rate\n"
         "POD Detention = CGO → CER   priced at the detention rate",
         language=None,
     )
@@ -1045,73 +1019,66 @@ with tab_overview:
         if not rdf.empty:
             n = len(rdf)
             with_rate = int(rdf["DEM_RATE"].notna().sum()) if "DEM_RATE" in rdf.columns else 0
-            pol_ok = int(pd.to_numeric(rdf.get("POL_DEM_TOTAL_DAYS"), errors="coerce").notna().sum())
             pod_ok = int(pd.to_numeric(rdf.get("POD_DEM_TOTAL_DAYS"), errors="coerce").notna().sum())
             det_ok = int(pd.to_numeric(rdf.get("POD_DET_TOTAL_DAYS"), errors="coerce").notna().sum())
             st.markdown("**Matched shipments**")
             st.write({
                 "matched_shipments": n,
                 "with_a_demurrage_rate": f"{with_rate}/{n}",
-                "with_POL_demurrage_days (CGI→CLL)": f"{pol_ok}/{n}",
                 "with_POD_demurrage_days (CDD→CGO)": f"{pod_ok}/{n}",
                 "with_POD_detention_days (CGO→…)": f"{det_ok}/{n}",
                 "total_DD_cost": f"${diag_total:,.2f}",
             })
             if with_rate == 0:
                 st.error("Matched shipments carry NO rate → the contract rate column wasn't read. See the Contract section above.")
-            elif pol_ok == 0 and pod_ok == 0 and det_ok == 0:
-                st.error("No dwell days computed → milestone columns (CGI/CLL/CDD/CGO/CER) weren't found or are empty. "
+            elif pod_ok == 0 and det_ok == 0:
+                st.error("No dwell days computed → milestone columns (CDD/CGO/CER) weren't found or are empty. "
                          "Check the shipment file's milestone column names.")
 
     if fdf.empty:
         st.warning("No matched shipments available for the selected filters.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Total D&D Cost", f"${fdf['TOTAL_DD_COST'].sum():,.0f}",
                   f"{len(fdf)} matched of {total_shipments:,}",
-                  help="POL demurrage + POD demurrage + POD detention across matched shipments.")
-        c2.metric("POL Demurrage", f"${fdf['POL_DEM_COST'].sum():,.0f}",
-                  f"{(fdf['POL_DEM_COST'] > 0).sum()} shipments",
-                  help="Container gate-in at POL to loaded-on-vessel, at the demurrage rate.")
-        c3.metric("POD Demurrage", f"${fdf['POD_DEM_COST'].sum():,.0f}",
+                  help="POD demurrage + POD detention across matched shipments.")
+        c2.metric("POD Demurrage", f"${fdf['POD_DEM_COST'].sum():,.0f}",
                   f"{(fdf['POD_DEM_COST'] > 0).sum()} shipments",
                   help="Discharge at POD to gate-out-full at POD, at the demurrage rate.")
-        c4.metric("POD Detention", f"${fdf['POD_DET_COST'].sum():,.0f}",
+        c3.metric("POD Detention", f"${fdf['POD_DET_COST'].sum():,.0f}",
                   f"{(fdf['POD_DET_COST'] > 0).sum()} shipments",
                   help="Gate-out-full at POD to empty return, at the detention rate.")
 
-        c1, c2, c3, c4 = st.columns(4)
-        avg_pol = fdf.loc[fdf["POL_DEM_COST"] > 0, "POL_DEM_CHARGEABLE_DAYS"].mean()
+        c1, c2, c3 = st.columns(3)
         avg_pod = fdf.loc[fdf["POD_DEM_COST"] > 0, "POD_DEM_CHARGEABLE_DAYS"].mean()
         avg_det = fdf.loc[fdf["POD_DET_COST"] > 0, "POD_DET_CHARGEABLE_DAYS"].mean()
-        c1.metric("Avg POL Dem Days", f"{avg_pol:.1f}d" if not np.isnan(avg_pol) else "—")
-        c2.metric("Avg POD Dem Days", f"{avg_pod:.1f}d" if not np.isnan(avg_pod) else "—")
-        c3.metric("Avg POD Det Days", f"{avg_det:.1f}d" if not np.isnan(avg_det) else "—")
-        c4.metric("⚠️ Accumulating", f"{fdf['DET_ACCUMULATING'].sum()}", "ACTIVE, no CER",
+        c1.metric("Avg POD Dem Days", f"{avg_pod:.1f}d" if not np.isnan(avg_pod) else "—")
+        c2.metric("Avg POD Det Days", f"{avg_det:.1f}d" if not np.isnan(avg_det) else "—")
+        c3.metric("⚠️ Accumulating", f"{fdf['DET_ACCUMULATING'].sum()}", "ACTIVE, no CER",
                   help="Active shipments with no empty return. Detention is calculated to today and keeps growing.")
 
         if cancelled_count > 0:
             st.caption(f"ℹ️ {cancelled_count} cancelled shipments excluded from analysis.")
 
         st.markdown("---")
-        st.caption("💡 Cost split by carrier / FFW. Blue = POL demurrage, orange = POD demurrage, purple = POD detention.")
+        st.caption("💡 Cost split by carrier / FFW. Orange = POD demurrage, purple = POD detention.")
         carrier_agg = (
             fdf.groupby("CARRIER_FFW_SCAC")
-            .agg(POL_Demurrage=("POL_DEM_COST", "sum"), POD_Demurrage=("POD_DEM_COST", "sum"),
+            .agg(POD_Demurrage=("POD_DEM_COST", "sum"),
                  POD_Detention=("POD_DET_COST", "sum"))
             .reset_index()
         )
         carrier_melt = carrier_agg.melt(id_vars="CARRIER_FFW_SCAC", var_name="Type", value_name="Cost")
         carrier_melt["Type"] = carrier_melt["Type"].replace(
-            {"POL_Demurrage": "POL Demurrage", "POD_Demurrage": "POD Demurrage", "POD_Detention": "POD Detention"})
+            {"POD_Demurrage": "POD Demurrage", "POD_Detention": "POD Detention"})
         chart_carrier = (
             alt.Chart(carrier_melt).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
             .encode(
                 y=alt.Y("CARRIER_FFW_SCAC:N", sort="-x", title="Carrier / FFW"),
                 x=alt.X("Cost:Q", title="Cost (USD)"),
                 color=alt.Color("Type:N", scale=alt.Scale(
-                    domain=["POL Demurrage", "POD Demurrage", "POD Detention"],
-                    range=[POL_DEM_COLOR, DEM_COLOR, DET_COLOR])),
+                    domain=["POD Demurrage", "POD Detention"],
+                    range=[DEM_COLOR, DET_COLOR])),
                 tooltip=["CARRIER_FFW_SCAC", "Type", alt.Tooltip("Cost:Q", format="$,.0f")],
             ).properties(title="D&D Cost by Carrier / FFW", height=280)
         )
@@ -1120,21 +1087,21 @@ with tab_overview:
         st.caption("💡 Cost split by POD terminal. High POD demurrage = pickup/terminal delay. High detention = empty-return delay.")
         pod_agg = (
             fdf.groupby("POD_LOCODE")
-            .agg(POL_Demurrage=("POL_DEM_COST", "sum"), POD_Demurrage=("POD_DEM_COST", "sum"),
+            .agg(POD_Demurrage=("POD_DEM_COST", "sum"),
                  POD_Detention=("POD_DET_COST", "sum"))
             .reset_index()
         )
         pod_melt = pod_agg.melt(id_vars="POD_LOCODE", var_name="Type", value_name="Cost")
         pod_melt["Type"] = pod_melt["Type"].replace(
-            {"POL_Demurrage": "POL Demurrage", "POD_Demurrage": "POD Demurrage", "POD_Detention": "POD Detention"})
+            {"POD_Demurrage": "POD Demurrage", "POD_Detention": "POD Detention"})
         chart_pod = (
             alt.Chart(pod_melt).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
             .encode(
                 y=alt.Y("POD_LOCODE:N", sort="-x", title="POD Terminal"),
                 x=alt.X("Cost:Q", title="Cost (USD)"),
                 color=alt.Color("Type:N", scale=alt.Scale(
-                    domain=["POL Demurrage", "POD Demurrage", "POD Detention"],
-                    range=[POL_DEM_COLOR, DEM_COLOR, DET_COLOR])),
+                    domain=["POD Demurrage", "POD Detention"],
+                    range=[DEM_COLOR, DET_COLOR])),
                 tooltip=["POD_LOCODE", "Type", alt.Tooltip("Cost:Q", format="$,.0f")],
             ).properties(title="D&D Cost by POD Terminal", height=250)
         )
@@ -1145,7 +1112,7 @@ with tab_overview:
 # -----------------------------------------------------------------------------
 with tab_trends:
     st.markdown("### D&D Trends")
-    st.caption("Trend date uses CDD when available, then CGO, then CER, then CLL/CGI as fallback.")
+    st.caption("Trend date uses CDD when available, then CGO, then CER as fallback.")
     if fdf.empty:
         st.warning("No matched/priced shipments available for the selected filters.")
     else:
@@ -1163,9 +1130,9 @@ with tab_trends:
                 period_title = "Month"
             trend_agg = (
                 trend_df.groupby("PERIOD")
-                .agg(Shipments=("SHIPMENT_ID", "count"), POL_Demurrage=("POL_DEM_COST", "sum"),
+                .agg(Shipments=("SHIPMENT_ID", "count"),
                      POD_Demurrage=("POD_DEM_COST", "sum"), Detention=("POD_DET_COST", "sum"),
-                     Total=("TOTAL_DD_COST", "sum"), Avg_POL_Dem_Days=("POL_DEM_CHARGEABLE_DAYS", "mean"),
+                     Total=("TOTAL_DD_COST", "sum"),
                      Avg_POD_Dem_Days=("POD_DEM_CHARGEABLE_DAYS", "mean"), Avg_Det_Days=("POD_DET_CHARGEABLE_DAYS", "mean"),
                      Accumulating=("DET_ACCUMULATING", "sum"))
                 .reset_index().sort_values("PERIOD")
@@ -1177,17 +1144,17 @@ with tab_trends:
             c4.metric("Accumulating", f"{int(trend_agg['Accumulating'].sum()):,}", "ACTIVE, no CER")
 
             st.markdown("#### Cost Trend")
-            cost_melt = trend_agg.melt(id_vars=["PERIOD"], value_vars=["POL_Demurrage", "POD_Demurrage", "Detention"],
+            cost_melt = trend_agg.melt(id_vars=["PERIOD"], value_vars=["POD_Demurrage", "Detention"],
                                        var_name="Charge Type", value_name="Cost")
             cost_melt["Charge Type"] = cost_melt["Charge Type"].replace(
-                {"POL_Demurrage": "POL Demurrage", "POD_Demurrage": "POD Demurrage"})
+                {"POD_Demurrage": "POD Demurrage"})
             cost_chart = (
                 alt.Chart(cost_melt).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
                 .encode(
                     x=alt.X("PERIOD:T", title=period_title), y=alt.Y("Cost:Q", title="Cost"),
                     color=alt.Color("Charge Type:N", scale=alt.Scale(
-                        domain=["POL Demurrage", "POD Demurrage", "Detention"],
-                        range=[POL_DEM_COLOR, DEM_COLOR, DET_COLOR])),
+                        domain=["POD Demurrage", "Detention"],
+                        range=[DEM_COLOR, DET_COLOR])),
                     tooltip=[alt.Tooltip("PERIOD:T", title=period_title), "Charge Type:N", alt.Tooltip("Cost:Q", format="$,.0f")],
                 ).properties(height=350)
             )
@@ -1205,16 +1172,16 @@ with tab_trends:
                 st.altair_chart(shipment_chart, use_container_width=True)
             with col2:
                 st.markdown("#### Avg Chargeable Days")
-                days_melt = trend_agg.melt(id_vars=["PERIOD"], value_vars=["Avg_POL_Dem_Days", "Avg_POD_Dem_Days", "Avg_Det_Days"],
+                days_melt = trend_agg.melt(id_vars=["PERIOD"], value_vars=["Avg_POD_Dem_Days", "Avg_Det_Days"],
                                            var_name="Metric", value_name="Days")
                 days_melt["Metric"] = days_melt["Metric"].replace(
-                    {"Avg_POL_Dem_Days": "POL Demurrage", "Avg_POD_Dem_Days": "POD Demurrage", "Avg_Det_Days": "Detention"})
+                    {"Avg_POD_Dem_Days": "POD Demurrage", "Avg_Det_Days": "Detention"})
                 days_chart = (
                     alt.Chart(days_melt).mark_line(point=True)
                     .encode(x=alt.X("PERIOD:T", title=period_title), y=alt.Y("Days:Q", title="Avg Chargeable Days"),
                             color=alt.Color("Metric:N", scale=alt.Scale(
-                                domain=["POL Demurrage", "POD Demurrage", "Detention"],
-                                range=[POL_DEM_COLOR, DEM_COLOR, DET_COLOR])),
+                                domain=["POD Demurrage", "Detention"],
+                                range=[DEM_COLOR, DET_COLOR])),
                             tooltip=[alt.Tooltip("PERIOD:T", title=period_title), "Metric:N", alt.Tooltip("Days:Q", format=".1f")])
                     .properties(height=280)
                 )
@@ -1223,8 +1190,8 @@ with tab_trends:
             st.markdown("#### Trend Summary")
             st.dataframe(
                 trend_agg.style.format({
-                    "POL_Demurrage": "${:,.0f}", "POD_Demurrage": "${:,.0f}", "Detention": "${:,.0f}",
-                    "Total": "${:,.0f}", "Avg_POL_Dem_Days": "{:.1f}", "Avg_POD_Dem_Days": "{:.1f}", "Avg_Det_Days": "{:.1f}"}),
+                    "POD_Demurrage": "${:,.0f}", "Detention": "${:,.0f}",
+                    "Total": "${:,.0f}", "Avg_POD_Dem_Days": "{:.1f}", "Avg_Det_Days": "{:.1f}"}),
                 use_container_width=True, hide_index=True,
             )
 
@@ -1248,7 +1215,7 @@ with tab_trends:
             gap_agg = (
                 gap_trend.groupby("PERIOD")
                 .agg(Unmatched_Shipments=("SHIPMENT_ID", "count"), Risk_Shipments=("RISK_FLAG", "sum"),
-                     Missing_Contract_Keys=("MATCH_KEY", "nunique"), Avg_POL_Dem_Days=("POL_DEM_TOTAL_DAYS", "mean"),
+                     Missing_Contract_Keys=("MATCH_KEY", "nunique"),
                      Avg_POD_Dem_Days=("POD_DEM_TOTAL_DAYS", "mean"), Avg_POD_Det_Days=("POD_DET_TOTAL_DAYS", "mean"))
                 .reset_index().sort_values("PERIOD")
             )
@@ -1260,7 +1227,7 @@ with tab_trends:
             )
             st.altair_chart(gap_chart, use_container_width=True)
             st.dataframe(
-                gap_agg.style.format({"Avg_POL_Dem_Days": "{:.1f}", "Avg_POD_Dem_Days": "{:.1f}", "Avg_POD_Det_Days": "{:.1f}"}),
+                gap_agg.style.format({"Avg_POD_Dem_Days": "{:.1f}", "Avg_POD_Det_Days": "{:.1f}"}),
                 use_container_width=True, hide_index=True,
             )
 
@@ -1275,21 +1242,19 @@ with tab_carrier:
         carrier_detail = (
             fdf.groupby(["CARRIER_FFW_SCAC", "MATCHED_PARTY_TYPE", "CARRIER_SCAC", "FFW_SCAC", "CARRIER_NAME"], dropna=False)
             .agg(Ships=("SHIPMENT_ID", "count"),
-                 POL_Dem_Ships=("POL_DEM_COST", lambda x: (x > 0).sum()),
                  POD_Dem_Ships=("POD_DEM_COST", lambda x: (x > 0).sum()),
                  Det_Ships=("POD_DET_COST", lambda x: (x > 0).sum()),
-                 POL_Dem_Cost=("POL_DEM_COST", "sum"), POD_Dem_Cost=("POD_DEM_COST", "sum"), Det_Cost=("POD_DET_COST", "sum"),
-                 Avg_POL_Dem_Days=("POL_DEM_CHARGEABLE_DAYS", lambda x: x[x > 0].mean() if (x > 0).any() else 0),
+                 POD_Dem_Cost=("POD_DEM_COST", "sum"), Det_Cost=("POD_DET_COST", "sum"),
                  Avg_POD_Dem_Days=("POD_DEM_CHARGEABLE_DAYS", lambda x: x[x > 0].mean() if (x > 0).any() else 0),
                  Avg_Det_Days=("POD_DET_CHARGEABLE_DAYS", lambda x: x[x > 0].mean() if (x > 0).any() else 0))
             .reset_index()
         )
-        carrier_detail["Total_Cost"] = carrier_detail["POL_Dem_Cost"] + carrier_detail["POD_Dem_Cost"] + carrier_detail["Det_Cost"]
+        carrier_detail["Total_Cost"] = carrier_detail["POD_Dem_Cost"] + carrier_detail["Det_Cost"]
         carrier_detail = carrier_detail.sort_values("Total_Cost", ascending=False)
         st.dataframe(
             carrier_detail.style.format({
-                "POL_Dem_Cost": "${:,.0f}", "POD_Dem_Cost": "${:,.0f}", "Det_Cost": "${:,.0f}", "Total_Cost": "${:,.0f}",
-                "Avg_POL_Dem_Days": "{:.1f}", "Avg_POD_Dem_Days": "{:.1f}", "Avg_Det_Days": "{:.1f}"}),
+                "POD_Dem_Cost": "${:,.0f}", "Det_Cost": "${:,.0f}", "Total_Cost": "${:,.0f}",
+                "Avg_POD_Dem_Days": "{:.1f}", "Avg_Det_Days": "{:.1f}"}),
             use_container_width=True, hide_index=True,
         )
 
@@ -1297,11 +1262,11 @@ with tab_carrier:
         st.markdown("#### Carrier / FFW × POD Breakdown")
         cp = (
             fdf.groupby(["CARRIER_FFW_SCAC", "MATCHED_PARTY_TYPE", "POD_LOCODE"], dropna=False)
-            .agg(Ships=("SHIPMENT_ID", "count"), POL_Dem=("POL_DEM_COST", "sum"),
+            .agg(Ships=("SHIPMENT_ID", "count"),
                  POD_Dem=("POD_DEM_COST", "sum"), Det=("POD_DET_COST", "sum"))
             .reset_index()
         )
-        cp["Total"] = cp["POL_Dem"] + cp["POD_Dem"] + cp["Det"]
+        cp["Total"] = cp["POD_Dem"] + cp["Det"]
         cp = cp[cp["Total"] > 0].sort_values("Total", ascending=False)
         if len(cp) > 0:
             heat = (
@@ -1309,7 +1274,7 @@ with tab_carrier:
                 .encode(x=alt.X("POD_LOCODE:N", title="POD"), y=alt.Y("CARRIER_FFW_SCAC:N", title="Carrier / FFW"),
                         color=alt.Color("Total:Q", scale=alt.Scale(scheme="oranges"), title="Total D&D"),
                         tooltip=["CARRIER_FFW_SCAC", "MATCHED_PARTY_TYPE", "POD_LOCODE", "Ships",
-                                 alt.Tooltip("POL_Dem:Q", format="$,.0f"), alt.Tooltip("POD_Dem:Q", format="$,.0f"),
+                                 alt.Tooltip("POD_Dem:Q", format="$,.0f"),
                                  alt.Tooltip("Det:Q", format="$,.0f"), alt.Tooltip("Total:Q", format="$,.0f")])
                 .properties(title="Cost Heatmap: Carrier / FFW × POD", height=280)
             )
@@ -1318,7 +1283,7 @@ with tab_carrier:
                 color=alt.condition(alt.datum.Total > cp["Total"].median(), alt.value("white"), alt.value("black")))
             st.altair_chart(heat + text, use_container_width=True)
         st.dataframe(
-            cp.style.format({"POL_Dem": "${:,.0f}", "POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
+            cp.style.format({"POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
             use_container_width=True, hide_index=True,
         )
 
@@ -1335,28 +1300,28 @@ with tab_port:
             st.markdown("#### POD Terminal Summary")
             pod_sum = (
                 fdf.groupby(["POD_LOCODE", "POD"])
-                .agg(Ships=("SHIPMENT_ID", "count"), POL_Dem=("POL_DEM_COST", "sum"),
+                .agg(Ships=("SHIPMENT_ID", "count"),
                      POD_Dem=("POD_DEM_COST", "sum"), Det=("POD_DET_COST", "sum"))
                 .reset_index()
             )
-            pod_sum["Total"] = pod_sum["POL_Dem"] + pod_sum["POD_Dem"] + pod_sum["Det"]
+            pod_sum["Total"] = pod_sum["POD_Dem"] + pod_sum["Det"]
             pod_sum = pod_sum.sort_values("Total", ascending=False)
             st.dataframe(
-                pod_sum.style.format({"POL_Dem": "${:,.0f}", "POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
+                pod_sum.style.format({"POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
                 use_container_width=True, hide_index=True,
             )
         with col2:
             st.markdown("#### Cost Split by POD")
-            pod_melt2 = pod_sum.melt(id_vars="POD_LOCODE", value_vars=["POL_Dem", "POD_Dem", "Det"],
+            pod_melt2 = pod_sum.melt(id_vars="POD_LOCODE", value_vars=["POD_Dem", "Det"],
                                      var_name="Type", value_name="Cost")
             pod_melt2["Type"] = pod_melt2["Type"].replace(
-                {"POL_Dem": "POL Demurrage", "POD_Dem": "POD Demurrage", "Det": "POD Detention"})
+                {"POD_Dem": "POD Demurrage", "Det": "POD Detention"})
             ch = (
                 alt.Chart(pod_melt2).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
                 .encode(x=alt.X("POD_LOCODE:N", title="POD"), y=alt.Y("Cost:Q", title="Cost (USD)", stack=True),
                         color=alt.Color("Type:N", scale=alt.Scale(
-                            domain=["POL Demurrage", "POD Demurrage", "POD Detention"],
-                            range=[POL_DEM_COLOR, DEM_COLOR, DET_COLOR])),
+                            domain=["POD Demurrage", "POD Detention"],
+                            range=[DEM_COLOR, DET_COLOR])),
                         tooltip=["POD_LOCODE", "Type", alt.Tooltip("Cost:Q", format="$,.0f")])
                 .properties(height=320)
             )
@@ -1368,16 +1333,15 @@ with tab_port:
             fdf.groupby("LANE")
             .agg(Ships=("SHIPMENT_ID", "count"),
                  Carrier_FFWs=("CARRIER_FFW_SCAC", lambda x: ", ".join(sorted(x.dropna().astype(str).unique()))),
-                 POL_Dem=("POL_DEM_COST", "sum"), POD_Dem=("POD_DEM_COST", "sum"), Det=("POD_DET_COST", "sum"),
-                 Avg_POL_Dem_Days=("POL_DEM_CHARGEABLE_DAYS", lambda x: round(x[x > 0].mean(), 1) if (x > 0).any() else 0),
+                 POD_Dem=("POD_DEM_COST", "sum"), Det=("POD_DET_COST", "sum"),
                  Avg_POD_Dem_Days=("POD_DEM_CHARGEABLE_DAYS", lambda x: round(x[x > 0].mean(), 1) if (x > 0).any() else 0),
                  Avg_Det_Days=("POD_DET_CHARGEABLE_DAYS", lambda x: round(x[x > 0].mean(), 1) if (x > 0).any() else 0))
             .reset_index()
         )
-        lane_agg["Total"] = lane_agg["POL_Dem"] + lane_agg["POD_Dem"] + lane_agg["Det"]
+        lane_agg["Total"] = lane_agg["POD_Dem"] + lane_agg["Det"]
         lane_agg = lane_agg.sort_values("Total", ascending=False).head(20)
         st.dataframe(
-            lane_agg.style.format({"POL_Dem": "${:,.0f}", "POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
+            lane_agg.style.format({"POD_Dem": "${:,.0f}", "Det": "${:,.0f}", "Total": "${:,.0f}"}),
             use_container_width=True, hide_index=True,
         )
 
@@ -1390,22 +1354,21 @@ with tab_ships:
         st.warning("No matched shipments available for the selected filters.")
     else:
         st.caption(f"Showing {len(fdf)} matched shipments. Use sidebar filters to narrow.")
-        sort_options = ["TOTAL_DD_COST", "POL_DEM_COST", "POD_DEM_COST", "POD_DET_COST",
-                        "POL_DEM_CHARGEABLE_DAYS", "POD_DEM_CHARGEABLE_DAYS", "POD_DET_CHARGEABLE_DAYS"]
+        sort_options = ["TOTAL_DD_COST", "POD_DEM_COST", "POD_DET_COST",
+                        "POD_DEM_CHARGEABLE_DAYS", "POD_DET_CHARGEABLE_DAYS"]
         sort_col = st.selectbox("Sort by", sort_options)
         top_n = st.slider("Show top N", 10, min(500, max(len(fdf), 10)), min(50, max(len(fdf), 10)))
 
         display_cols = [
             "CONTAINER_NUMBER", "SHIPMENT_ID", "CARRIER_SCAC", "FFW_SCAC", "CARRIER_FFW_SCAC",
-            "MATCHED_PARTY_TYPE", "LANE", "CGI", "CLL", "CDD", "CGO", "CER",
+            "MATCHED_PARTY_TYPE", "LANE", "CDD", "CGO", "CER",
             "DEM_RATE", "DET_RATE",
-            "POL_DEM_TOTAL_DAYS", "POL_DEM_CHARGEABLE_DAYS", "POL_DEM_COST",
             "POD_DEM_TOTAL_DAYS", "POD_DEM_CHARGEABLE_DAYS", "POD_DEM_COST",
             "POD_DET_TOTAL_DAYS", "POD_DET_CHARGEABLE_DAYS", "POD_DET_COST",
             "TOTAL_DD_COST", "CONTRACT_TYPE", "DET_ACCUMULATING", "DET_END_SOURCE",
         ]
         show_df = fdf[[c for c in display_cols if c in fdf.columns]].sort_values(sort_col, ascending=False).head(top_n).copy()
-        for dc in ["CGI", "CLL", "CDD", "CGO", "CER"]:
+        for dc in ["CDD", "CGO", "CER"]:
             if dc in show_df.columns:
                 show_df[dc] = pd.to_datetime(show_df[dc], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
         show_df["DET_STATUS"] = show_df.apply(
@@ -1415,7 +1378,7 @@ with tab_ships:
         st.dataframe(
             show_df.style.format({
                 "DEM_RATE": _fmt_money(0), "DET_RATE": _fmt_money(0),
-                "POL_DEM_COST": _fmt_money(2), "POD_DEM_COST": _fmt_money(2),
+                "POD_DEM_COST": _fmt_money(2),
                 "POD_DET_COST": _fmt_money(2), "TOTAL_DD_COST": _fmt_money(2)}),
             use_container_width=True, hide_index=True, height=600,
         )
@@ -1425,7 +1388,7 @@ with tab_ships:
             st.info("There's nothing to download because no priced shipments have D&D cost greater than $0.")
         else:
             download_df = priced_download_df[[c for c in display_cols if c in priced_download_df.columns]].copy()
-            for dc in ["CGI", "CLL", "CDD", "CGO", "CER"]:
+            for dc in ["CDD", "CGO", "CER"]:
                 if dc in download_df.columns:
                     download_df[dc] = pd.to_datetime(download_df[dc], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
             download_df["DET_STATUS"] = download_df.apply(
@@ -1440,16 +1403,8 @@ with tab_ships:
             )
 
         st.markdown("---")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            pol_data = fdf.loc[fdf["POL_DEM_COST"] > 0, ["POL_DEM_CHARGEABLE_DAYS"]].copy()
-            if len(pol_data) > 0:
-                st.altair_chart(
-                    alt.Chart(pol_data).mark_bar(color=POL_DEM_COLOR, cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                    .encode(x=alt.X("POL_DEM_CHARGEABLE_DAYS:Q", bin=alt.Bin(maxbins=20), title="Chargeable Days"),
-                            y=alt.Y("count()", title="Shipments")).properties(title="POL Demurrage Days", height=230),
-                    use_container_width=True)
-        with col2:
             dem_data = fdf.loc[fdf["POD_DEM_COST"] > 0, ["POD_DEM_CHARGEABLE_DAYS"]].copy()
             if len(dem_data) > 0:
                 st.altair_chart(
@@ -1457,7 +1412,7 @@ with tab_ships:
                     .encode(x=alt.X("POD_DEM_CHARGEABLE_DAYS:Q", bin=alt.Bin(maxbins=20), title="Chargeable Days"),
                             y=alt.Y("count()", title="Shipments")).properties(title="POD Demurrage Days", height=230),
                     use_container_width=True)
-        with col3:
+        with col2:
             det_data = fdf.loc[fdf["POD_DET_COST"] > 0, ["POD_DET_CHARGEABLE_DAYS"]].copy()
             if len(det_data) > 0:
                 st.altair_chart(
@@ -1492,13 +1447,13 @@ with tab_gaps:
             gap_source.groupby(["POD_LOCODE", "CARRIER_FFW_SCAC", "MATCHED_PARTY_TYPE", "CARRIER_SCAC", "FFW_SCAC", "POL_LOCODE", "MATCH_KEY"], dropna=False)
             .agg(Shipments=("SHIPMENT_ID", "count"), Containers=("CONTAINER_NUMBER", lambda x: x.nunique()),
                  Risk_Containers=("RISK_FLAG", lambda x: int(x.sum())),
-                 Avg_POL_Dem_Days=("POL_DEM_TOTAL_DAYS", "mean"), Avg_POD_Dem_Days=("POD_DEM_TOTAL_DAYS", "mean"),
+                 Avg_POD_Dem_Days=("POD_DEM_TOTAL_DAYS", "mean"),
                  Avg_POD_Det_Days=("POD_DET_TOTAL_DAYS", "mean"), Max_POD_Det_Days=("POD_DET_TOTAL_DAYS", "max"),
                  Active_No_CER=("DET_ACCUMULATING", lambda x: int(x.sum())))
             .reset_index().sort_values(["Risk_Containers", "Shipments"], ascending=False)
         )
         st.dataframe(
-            combo.style.format({"Avg_POL_Dem_Days": "{:.1f}", "Avg_POD_Dem_Days": "{:.1f}",
+            combo.style.format({"Avg_POD_Dem_Days": "{:.1f}",
                                 "Avg_POD_Det_Days": "{:.1f}", "Max_POD_Det_Days": "{:.1f}"}),
             use_container_width=True, hide_index=True,
         )
@@ -1506,12 +1461,12 @@ with tab_gaps:
         st.markdown("---")
         st.markdown("#### Container-Level Contract Gap Risk")
         gap_cols = ["CONTAINER_NUMBER", "SHIPMENT_ID", "CARRIER_SCAC", "FFW_SCAC", "CARRIER_FFW_SCAC",
-                    "MATCHED_PARTY_TYPE", "LANE", "CGI", "CLL", "CDD", "CGO", "CER",
-                    "POL_DEM_TOTAL_DAYS", "POD_DEM_TOTAL_DAYS", "POD_DET_TOTAL_DAYS", "DET_ACCUMULATING",
+                    "MATCHED_PARTY_TYPE", "LANE", "CDD", "CGO", "CER",
+                    "POD_DEM_TOTAL_DAYS", "POD_DET_TOTAL_DAYS", "DET_ACCUMULATING",
                     "RISK_SCORE", "RISK_REASONS", "MATCH_KEY", "DATA_LIMITATION"]
         gap_show = gap_source[[c for c in gap_cols if c in gap_source.columns]].sort_values(
-            ["RISK_SCORE", "POD_DET_TOTAL_DAYS", "POD_DEM_TOTAL_DAYS", "POL_DEM_TOTAL_DAYS"], ascending=False).copy()
-        for dc in ["CGI", "CLL", "CDD", "CGO", "CER"]:
+            ["RISK_SCORE", "POD_DET_TOTAL_DAYS", "POD_DEM_TOTAL_DAYS"], ascending=False).copy()
+        for dc in ["CDD", "CGO", "CER"]:
             if dc in gap_show.columns:
                 gap_show[dc] = pd.to_datetime(gap_show[dc], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
         st.dataframe(gap_show, use_container_width=True, hide_index=True, height=520)
@@ -1563,12 +1518,11 @@ with tab_download:
             summary_data = {
                 "Metric": ["Total Shipments in Upload", "Cancelled Excluded", "Matched / Priced Shipments",
                            "Unmatched Shipments", "Unmatched Risk Containers", "Total D&D Cost",
-                           "POL Demurrage", "POD Demurrage", "POD Detention", "Detention Accumulating", "Analysis Date"],
+                           "POD Demurrage", "POD Detention", "Detention Accumulating", "Analysis Date"],
                 "Value": [
                     total_shipments, cancelled_count, len(rdf), len(unmatched_df),
                     int(unmatched_df["RISK_FLAG"].sum()) if not unmatched_df.empty else 0,
                     f"${rdf['TOTAL_DD_COST'].sum():,.2f}" if not rdf.empty else "$0.00",
-                    f"${rdf['POL_DEM_COST'].sum():,.2f}" if not rdf.empty else "$0.00",
                     f"${rdf['POD_DEM_COST'].sum():,.2f}" if not rdf.empty else "$0.00",
                     f"${rdf['POD_DET_COST'].sum():,.2f}" if not rdf.empty else "$0.00",
                     int(rdf["DET_ACCUMULATING"].sum()) if not rdf.empty else 0,
@@ -1581,7 +1535,7 @@ with tab_download:
                 contracts_df.to_excel(writer, sheet_name="Contract", index=False)
             elif estimate_profile is not None:
                 pd.DataFrame([{
-                    "Demurrage Rate (USD/day, POL & POD)": estimate_profile.get("dem_rate"),
+                    "Demurrage Rate (USD/day, POD)": estimate_profile.get("dem_rate"),
                     "Detention Rate (USD/day)": estimate_profile.get("det_rate"),
                     "Free Demurrage Days": estimate_profile.get("dem_free"),
                     "Free Detention Days": estimate_profile.get("det_free"),
